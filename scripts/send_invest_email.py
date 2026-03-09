@@ -7,7 +7,10 @@ from email.header import Header
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-ENV_PATH = os.environ.get("MAIL_ENV_PATH", "/home/clawbot/.openclaw/workspace/.secrets/mail_163.env")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_ENV_PATH = os.path.join(ROOT, ".secrets", "mail_163.env")
+LEGACY_ENV_PATH = "/home/clawbot/.openclaw/workspace/.secrets/mail_163.env"
+ENV_PATH = os.environ.get("MAIL_ENV_PATH", DEFAULT_ENV_PATH if os.path.exists(DEFAULT_ENV_PATH) else LEGACY_ENV_PATH)
 
 
 def load_env(path: str):

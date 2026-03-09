@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-ROOT = Path('/home/clawbot/.openclaw/workspace')
+ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / 'research/a_share_policy_quant/policy_signals.json'
 OUT_DIR = ROOT / 'research/a_share_policy_quant/output'
 
