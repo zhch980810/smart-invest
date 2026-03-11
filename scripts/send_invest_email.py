@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import ssl
 import smtplib
 from email.mime.text import MIMEText
@@ -25,6 +26,26 @@ def load_env(path: str):
     return env
 
 
+def detect_quality_issues(body: str):
+    issues = []
+
+    source_alert = re.search(r"【数据源告警】(.+)", body)
+    if source_alert:
+        issues.append(f"数据源告警：{source_alert.group(1).strip()}")
+
+    zero_ma_hits = len(re.findall(r"MA5=0(?:\\.0+)?[,，]\s*MA20=0(?:\\.0+)?", body))
+    if zero_ma_hits >= 3:
+        issues.append(f"技术面数据异常：检测到 {zero_ma_hits} 处 MA5/MA20 为0")
+
+    if "过去24小时未抓取到可用资讯" in body:
+        issues.append("政策新闻抓取异常：过去24小时新闻为空")
+
+    if "MACD=未知" in body or "信号=未知" in body:
+        issues.append("技术指标异常：存在未知信号")
+
+    return issues
+
+
 def main():
     body = os.environ.get("MAIL_BODY", "").strip()
     if not body:
@@ -44,6 +65,16 @@ def main():
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     subject = f"A股中线投资晨报 | {now:%Y-%m-%d}"
 
+    issues = detect_quality_issues(body)
+    if issues:
+        subject = f"【发送中止】A股晨报数据异常 | {now:%Y-%m-%d}"
+        recipients = [user]
+        body = (
+            "本次晨报未发送给订阅邮箱，原因如下：\n"
+            + "\n".join([f"- {x}" for x in issues])
+            + "\n\n请先排查数据源或脚本，再重试发送。"
+        )
+
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = user
@@ -54,7 +85,10 @@ def main():
         server.login(user, password)
         server.sendmail(user, recipients, msg.as_string())
 
-    print(f"sent to {', '.join(recipients)}")
+    if issues:
+        print(f"blocked report send; alerted sender mailbox: {', '.join(recipients)} | issues: {'; '.join(issues)}")
+    else:
+        print(f"sent to {', '.join(recipients)}")
 
 
 if __name__ == "__main__":

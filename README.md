@@ -1,8 +1,10 @@
 # 智慧投资仓库（smart-invest）
 
 当前包含：
-- `scripts/select_a_shares.py`：A股“政策+量化”选股脚本（新浪免费接口，支持 API 调用上限）
-- `scripts/send_invest_email.py`：发送投资日报邮件
+- `scripts/select_a_shares.py`：A股“政策+量化”选股主入口（负责加载配置、输出报告）
+- `scripts/a_share_selector/data_fetch.py`：数据获取模块（快照、K线、政策新闻，多源自动切换）
+- `scripts/a_share_selector/quant_model.py`：量化/预测模块（筛选、打分、技术指标、板块分散）
+- `scripts/send_invest_email.py`：发送投资日报邮件（当数据源全部失效时自动中止群发并仅告警发件人）
 - `research/a_share_policy_quant/policy_signals.json`：政策主题配置
 - `research/a_share_policy_quant/README.md`：策略与使用说明
 
