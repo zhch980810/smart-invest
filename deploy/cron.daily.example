@@ -1,0 +1,7 @@
+# smart-invest 每日任务（示例）
+# 用法：crontab -e 后粘贴。建议在交易日早上执行（北京时间）。
+# 分 时 日 月 周 命令
+10 8 * * 1-5 /bin/bash /home/clawbot/.openclaw/workspace/smart-invest/scripts/run_daily_job.sh
+
+# 可选：每天 20:00 再跑一轮复盘
+# 0 20 * * 1-5 /bin/bash /home/clawbot/.openclaw/workspace/smart-invest/scripts/run_daily_job.sh

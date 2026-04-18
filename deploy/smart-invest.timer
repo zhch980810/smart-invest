@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Smart Invest Daily Job on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri 08:10:00 Asia/Shanghai
+Persistent=true
+Unit=smart-invest.service
+
+[Install]
+WantedBy=timers.target

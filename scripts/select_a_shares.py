@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sqlite3
+import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from zoneinfo import ZoneInfo
 
@@ -12,6 +15,8 @@ from a_share_selector.quant_model import select
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_PATH = ROOT / 'research/a_share_policy_quant/policy_signals.json'
 OUT_DIR = ROOT / 'research/a_share_policy_quant/output'
+DATA_DIR = ROOT / 'data'
+DB_PATH = DATA_DIR / 'smart_invest.db'
 TZ = ZoneInfo('Asia/Shanghai')
 
 
@@ -20,50 +25,296 @@ def load_policy() -> Dict:
         return json.load(f)
 
 
+def init_db() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS run_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                run_date TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                top_n INTEGER,
+                max_api_calls INTEGER,
+                api_calls_used INTEGER,
+                json_path TEXT,
+                txt_path TEXT,
+                changes_path TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            )
+            '''
+        )
+        cur.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS daily_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                rank_no INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                sector TEXT,
+                total_score REAL,
+                policy_score REAL,
+                quant_score REAL,
+                liquidity_score REAL,
+                tech_score REAL,
+                price REAL,
+                pct_chg REAL,
+                created_at TEXT NOT NULL,
+                UNIQUE(run_id, code)
+            )
+            '''
+        )
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_daily_candidates_date_rank ON daily_candidates(trade_date, rank_no)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_daily_candidates_code ON daily_candidates(code)')
+
+        cur.execute("PRAGMA table_info(run_logs)")
+        run_log_columns = {r[1] for r in cur.fetchall()}
+        if 'changes_path' not in run_log_columns:
+            cur.execute('ALTER TABLE run_logs ADD COLUMN changes_path TEXT')
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_previous_day_candidates(today_yyyymmdd: str) -> Tuple[Optional[str], List[Dict]]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            '''
+            SELECT MAX(dc.trade_date) AS prev_date
+            FROM daily_candidates dc
+            JOIN run_logs rl ON rl.run_id = dc.run_id
+            WHERE dc.trade_date < ? AND rl.status = 'success'
+            ''',
+            (today_yyyymmdd,),
+        )
+        row = cur.fetchone()
+        prev_date = row['prev_date'] if row and row['prev_date'] else None
+        if not prev_date:
+            return None, []
+
+        cur.execute(
+            '''
+            SELECT rl.run_id
+            FROM run_logs rl
+            WHERE rl.run_date = ? AND rl.status = 'success'
+            ORDER BY rl.finished_at DESC
+            LIMIT 1
+            ''',
+            (prev_date,),
+        )
+        run_row = cur.fetchone()
+        if not run_row:
+            return prev_date, []
+
+        cur.execute(
+            '''
+            SELECT dc.rank_no, dc.code, dc.name, dc.total_score
+            FROM daily_candidates dc
+            WHERE dc.run_id = ?
+            ORDER BY dc.rank_no ASC
+            ''',
+            (run_row['run_id'],),
+        )
+        rows = cur.fetchall()
+        return prev_date, [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def build_change_summary(
+    picks: List[Dict], prev_date: Optional[str], prev_rows: List[Dict], rank_top_n: int = 10
+) -> Tuple[List[str], Dict]:
+    lines: List[str] = ['【今日 vs 昨日变化】']
+    summary = {
+        'baseline_date': prev_date,
+        'has_baseline': bool(prev_date and prev_rows),
+        'added': [],
+        'removed': [],
+        'rank_changes': [],
+    }
+    if not prev_date or not prev_rows:
+        lines.append('昨日无可用成功记录，暂无对比。')
+        lines.append('')
+        return lines, summary
+
+    curr_rank = {x['code']: i for i, x in enumerate(picks, 1)}
+    prev_rank = {x['code']: int(x['rank_no']) for x in prev_rows}
+    code_to_name = {x['code']: x['name'] for x in picks}
+    for x in prev_rows:
+        code_to_name.setdefault(x['code'], x['name'])
+
+    curr_codes = set(curr_rank.keys())
+    prev_codes = set(prev_rank.keys())
+
+    added = sorted(curr_codes - prev_codes, key=lambda c: curr_rank[c])
+    removed = sorted(prev_codes - curr_codes, key=lambda c: prev_rank[c])
+
+    summary['added'] = [{'code': c, 'name': code_to_name[c], 'rank': curr_rank[c]} for c in added]
+    summary['removed'] = [{'code': c, 'name': code_to_name[c], 'prev_rank': prev_rank[c]} for c in removed]
+
+    lines.append(f'对比基准: {prev_date}')
+    lines.append('新增标的: ' + ('、'.join([f"{code_to_name[c]}({c})" for c in added]) if added else '无'))
+    lines.append('移除标的: ' + ('、'.join([f"{code_to_name[c]}({c})" for c in removed]) if removed else '无'))
+
+    changed = []
+    for c in curr_codes & prev_codes:
+        delta = prev_rank[c] - curr_rank[c]  # 正值=名次上升
+        if delta != 0:
+            changed.append((abs(delta), delta, c))
+    changed.sort(reverse=True)
+
+    lines.append(f'排名变化(Top {rank_top_n}):')
+    if not changed:
+        lines.append('  无明显排名变化')
+    else:
+        for _, delta, c in changed[:rank_top_n]:
+            direction = '↑' if delta > 0 else '↓'
+            lines.append(f"  {code_to_name[c]}({c}): {prev_rank[c]} -> {curr_rank[c]} ({direction}{abs(delta)})")
+            summary['rank_changes'].append(
+                {
+                    'code': c,
+                    'name': code_to_name[c],
+                    'prev_rank': prev_rank[c],
+                    'curr_rank': curr_rank[c],
+                    'delta': delta,
+                }
+            )
+
+    lines.append('')
+    return lines, summary
+
+
+def persist_to_db(
+    run_id: str,
+    trade_date: str,
+    started_at: str,
+    finished_at: str,
+    status: str,
+    top_n: int,
+    max_api_calls: int,
+    api_calls_used: int = 0,
+    json_path: str = '',
+    txt_path: str = '',
+    changes_path: str = '',
+    error_message: str = '',
+    picks: Optional[List[Dict]] = None,
+):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            '''
+            INSERT INTO run_logs (
+                run_id, run_date, started_at, finished_at, status,
+                top_n, max_api_calls, api_calls_used, json_path, txt_path,
+                changes_path, error_message, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                run_id,
+                trade_date,
+                started_at,
+                finished_at,
+                status,
+                top_n,
+                max_api_calls,
+                api_calls_used,
+                json_path,
+                txt_path,
+                changes_path,
+                error_message,
+                finished_at,
+            ),
+        )
+
+        if status == 'success' and picks:
+            rows = []
+            for i, s in enumerate(picks, 1):
+                rows.append(
+                    (
+                        run_id,
+                        trade_date,
+                        i,
+                        s['code'],
+                        s['name'],
+                        s.get('sector', ''),
+                        s.get('total_score', 0.0),
+                        s.get('policy_score', 0.0),
+                        s.get('quant_score', 0.0),
+                        s.get('liquidity_score', 0.0),
+                        s.get('tech_score', 0.0),
+                        s.get('price', 0.0),
+                        s.get('pct_chg', 0.0),
+                        finished_at,
+                    )
+                )
+            cur.executemany(
+                '''
+                INSERT INTO daily_candidates (
+                    run_id, trade_date, rank_no, code, name, sector,
+                    total_score, policy_score, quant_score, liquidity_score, tech_score,
+                    price, pct_chg, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                rows,
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def dump_outputs(
     picks: List[Dict],
     policy: Dict,
     api_calls_used: int,
     max_api_calls: int,
     stats: Dict,
-    policy_news: List[Dict],
-    policy_keywords: List[str],
-    policy_summary: str,
     source_status: Dict,
     sector_cap: int,
+    change_summary_lines: List[str],
+    change_summary_json: Dict,
 ):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     d = datetime.now(TZ).strftime('%Y%m%d')
     js_path = OUT_DIR / f'top10_{d}.json'
     txt_path = OUT_DIR / f'top10_{d}.txt'
+    changes_path = OUT_DIR / f'changes_{d}.json'
 
     payload = {
         'generated_at': datetime.now(TZ).isoformat(),
         'method': 'policy+quant+tech-v3',
         'policy_as_of': policy.get('as_of'),
-        'api_source': 'snapshot:sina, kline:auto, news:auto',
+        'api_source': 'snapshot:sina, kline:auto',
         'api_calls_used': api_calls_used,
         'max_api_calls': max_api_calls,
         'sector_cap': sector_cap,
         'filter_stats': stats,
-        'policy_news_24h': [
-            {
-                'time': x['time'].strftime('%Y-%m-%d %H:%M:%S'),
-                'title': x['title'],
-                'url': x['url'],
-                'source': x.get('source'),
-                'bullish_sectors': x.get('bullish_sectors', []),
-                'bearish_sectors': x.get('bearish_sectors', []),
-            }
-            for x in policy_news
-        ],
-        'policy_keywords': policy_keywords,
-        'policy_summary': policy_summary,
         'source_status': source_status,
         'top10': picks,
     }
     with open(js_path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    changes_payload = {
+        'generated_at': datetime.now(TZ).isoformat(),
+        'trade_date': d,
+        'summary': change_summary_json,
+    }
+    with open(changes_path, 'w', encoding='utf-8') as f:
+        json.dump(changes_payload, f, ensure_ascii=False, indent=2)
 
     now_str = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
     today_cn = datetime.now(TZ).strftime('%Y年%m月%d日')
@@ -74,42 +325,20 @@ def dump_outputs(
         f"K线主源/备源/兜底: {source_status['kline']['primary']} / {source_status['kline']['backup']} / {source_status['kline'].get('fallback', 'none')}"
     )
     lines.append(f"K线统计: {json.dumps(source_status['kline']['stats'], ensure_ascii=False)}")
-    lines.append(
-        f"消息面主源/备源/兜底: {source_status['news'].get('primary')} / {source_status['news'].get('backup')} / {source_status['news'].get('fallback', 'none')}"
-    )
-    lines.append(f"消息面实际使用: {source_status['news'].get('used') or 'none'}")
     if source_status.get('alerts'):
         lines.append('【数据源告警】' + '；'.join(source_status['alerts']))
-    if source_status['news'].get('errors'):
-        lines.append('【消息面切换日志】' + '；'.join(source_status['news']['errors'][:5]))
     lines.append('')
 
-    lines.append('【政策面关键词】')
-    lines.append('、'.join(policy_keywords))
-    lines.append(f'【政策面概括】{policy_summary}')
-    lines.append('')
-    neutral_cnt = sum(1 for n in policy_news if not n.get('bullish_sectors') and not n.get('bearish_sectors'))
-    lines.append(f'【政策新闻结构】方向性 {len(policy_news) - neutral_cnt} 条 | 中性 {neutral_cnt}/5 条')
-    lines.append(f'【过去24小时政策面消息（含板块影响）】（截至 {now_str}）')
-    if policy_news:
-        for i, n in enumerate(policy_news, 1):
-            bull = '、'.join(n.get('bullish_sectors') or ['中性'])
-            bear = '、'.join(n.get('bearish_sectors') or ['中性'])
-            lines.append(f"{i}. [{n['time'].strftime('%m-%d %H:%M')}] {n['title']}")
-            lines.append(f'   来源: {n.get("source", "unknown")}')
-            lines.append(f'   利好板块: {bull} | 利空板块: {bear}')
-            lines.append(f"   链接: {n['url']}")
-    else:
-        lines.append('过去24小时未抓取到可用资讯（可能受来源时效/网络影响）。')
+    lines.extend(change_summary_lines)
 
     lines.append('')
     lines.append('【抓取与筛选过程（宽松版）】')
     lines.append(
         f"{today_cn} 共抓取 {stats['total_fetched']} 只A股快照样本，字段包括: 价格、涨跌幅、成交额、振幅、换手率、PE(TTM)、PB、总市值。"
     )
-    lines.append(f'数据源: 新浪(快照) + 东财/腾讯/新浪(K线自动切换) + 新浪/东财/同花顺(消息面自动切换)')
+    lines.append('数据源: 新浪(快照) + 东财/腾讯/新浪(K线自动切换)')
     lines.append(f'快照API调用: {api_calls_used}/{max_api_calls}')
-    lines.append('筛选阈值: 价格>1.5元, 成交额>0.3亿元, 市值>10亿元, 0<PE<120, 0<PB<20')
+    lines.append('筛选阈值: 价格>1.5元, 成交额>0.3亿元, 市值>10亿元, 0<PE<240, 0<PB<20')
     lines.append(f"去除 ST/*ST: {stats['removed_st']} 只")
     lines.append(f"去除低价股: {stats['removed_low_price']} 只")
     lines.append(f"去除低成交额: {stats['removed_low_amount']} 只")
@@ -132,7 +361,7 @@ def dump_outputs(
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
-    return js_path, txt_path
+    return js_path, txt_path, changes_path
 
 
 def main():
@@ -143,30 +372,78 @@ def main():
     ap.add_argument('--sector-cap', type=int, default=4)
     args = ap.parse_args()
 
-    policy = load_policy()
-    picks, api_calls_used, stats, policy_news, policy_keywords, policy_summary, source_status = select(
-        policy=policy,
-        top_n=args.top,
-        horizon_days=args.horizon,
-        max_api_calls=args.max_api_calls,
-        sector_cap=args.sector_cap,
-    )
-    js_path, txt_path = dump_outputs(
-        picks,
-        policy,
-        api_calls_used,
-        args.max_api_calls,
-        stats,
-        policy_news,
-        policy_keywords,
-        policy_summary,
-        source_status,
-        args.sector_cap,
-    )
-    print(f'JSON: {js_path}')
-    print(f'TEXT: {txt_path}')
-    print(f'API calls(snapshot): {api_calls_used}/{args.max_api_calls}')
-    print(f'Fetched: {stats["total_fetched"]}, Remaining: {stats["remaining"]}, PolicyNews24h: {len(policy_news)}')
+    init_db()
+
+    run_id = str(uuid4())
+    started_at = datetime.now(TZ).isoformat()
+    trade_date = datetime.now(TZ).strftime('%Y%m%d')
+
+    try:
+        policy = load_policy()
+        prev_date, prev_rows = fetch_previous_day_candidates(trade_date)
+
+        picks, api_calls_used, stats, source_status = select(
+            policy=policy,
+            top_n=args.top,
+            horizon_days=args.horizon,
+            max_api_calls=args.max_api_calls,
+            sector_cap=args.sector_cap,
+        )
+        change_summary_lines, change_summary_json = build_change_summary(
+            picks, prev_date, prev_rows, rank_top_n=min(args.top, 10)
+        )
+
+        js_path, txt_path, changes_path = dump_outputs(
+            picks,
+            policy,
+            api_calls_used,
+            args.max_api_calls,
+            stats,
+            source_status,
+            args.sector_cap,
+            change_summary_lines,
+            change_summary_json,
+        )
+
+        finished_at = datetime.now(TZ).isoformat()
+        persist_to_db(
+            run_id=run_id,
+            trade_date=trade_date,
+            started_at=started_at,
+            finished_at=finished_at,
+            status='success',
+            top_n=args.top,
+            max_api_calls=args.max_api_calls,
+            api_calls_used=api_calls_used,
+            json_path=str(js_path),
+            txt_path=str(txt_path),
+            changes_path=str(changes_path),
+            picks=picks,
+        )
+
+        print(f'RunID: {run_id}')
+        print(f'DB: {DB_PATH}')
+        print(f'JSON: {js_path}')
+        print(f'TEXT: {txt_path}')
+        print(f'CHANGES: {changes_path}')
+        print(f'API calls(snapshot): {api_calls_used}/{args.max_api_calls}')
+        print(f'Fetched: {stats["total_fetched"]}, Remaining: {stats["remaining"]}')
+    except Exception as e:
+        finished_at = datetime.now(TZ).isoformat()
+        err = f'{e}\n{traceback.format_exc()}'
+        persist_to_db(
+            run_id=run_id,
+            trade_date=trade_date,
+            started_at=started_at,
+            finished_at=finished_at,
+            status='failed',
+            top_n=args.top,
+            max_api_calls=args.max_api_calls,
+            error_message=err,
+        )
+        print(f'RunID: {run_id}')
+        print(f'DB: {DB_PATH}')
+        raise
 
 
 if __name__ == '__main__':

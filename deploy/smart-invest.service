@@ -1,0 +1,17 @@
+[Unit]
+Description=Smart Invest Daily Job
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/clawbot/.openclaw/workspace/smart-invest
+ExecStart=/bin/bash /home/clawbot/.openclaw/workspace/smart-invest/scripts/run_daily_job.sh
+User=clawbot
+Group=clawbot
+Environment=PYTHONUNBUFFERED=1
+# 可选：通过覆盖文件设置 LOG_RETENTION_DAYS
+# Environment=LOG_RETENTION_DAYS=14
+
+[Install]
+WantedBy=multi-user.target

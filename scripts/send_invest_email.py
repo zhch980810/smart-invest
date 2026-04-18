@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
 import ssl
@@ -27,26 +28,27 @@ def load_env(path: str):
 
 
 def detect_quality_issues(body: str):
+    """
+    仅按“数据源双失效”规则拦截发送：
+    - 当正文出现【数据源告警】且包含“全部失效”时，拦截群发并仅告警发件人邮箱。
+    - 其余质量波动（如个别指标未知、新闻为空）不在此处拦截，避免误报。
+    """
     issues = []
 
-    source_alert = re.search(r"【数据源告警】(.+)", body)
-    if source_alert:
-        issues.append(f"数据源告警：{source_alert.group(1).strip()}")
-
-    zero_ma_hits = len(re.findall(r"MA5=0(?:\\.0+)?[,，]\s*MA20=0(?:\\.0+)?", body))
-    if zero_ma_hits >= 3:
-        issues.append(f"技术面数据异常：检测到 {zero_ma_hits} 处 MA5/MA20 为0")
-
-    if "过去24小时未抓取到可用资讯" in body:
-        issues.append("政策新闻抓取异常：过去24小时新闻为空")
-
-    if "MACD=未知" in body or "信号=未知" in body:
-        issues.append("技术指标异常：存在未知信号")
+    m = re.search(r"【数据源告警】(.+)", body)
+    if m:
+        alert_text = m.group(1).strip()
+        if "全部失效" in alert_text:
+            issues.append(f"数据源告警：{alert_text}")
 
     return issues
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--alert-only", action="store_true", help="仅告警发件人邮箱，不发送订阅群发")
+    args = ap.parse_args()
+
     body = os.environ.get("MAIL_BODY", "").strip()
     if not body:
         print("MAIL_BODY is empty", flush=True)
@@ -66,7 +68,10 @@ def main():
     subject = f"A股中线投资晨报 | {now:%Y-%m-%d}"
 
     issues = detect_quality_issues(body)
-    if issues:
+    if args.alert_only:
+        subject = f"【告警】A股晨报任务异常 | {now:%Y-%m-%d}"
+        recipients = [user]
+    elif issues:
         subject = f"【发送中止】A股晨报数据异常 | {now:%Y-%m-%d}"
         recipients = [user]
         body = (
@@ -85,7 +90,9 @@ def main():
         server.login(user, password)
         server.sendmail(user, recipients, msg.as_string())
 
-    if issues:
+    if args.alert_only:
+        print(f"alert-only mode; sent to sender mailbox: {', '.join(recipients)}")
+    elif issues:
         print(f"blocked report send; alerted sender mailbox: {', '.join(recipients)} | issues: {'; '.join(issues)}")
     else:
         print(f"sent to {', '.join(recipients)}")

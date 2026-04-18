@@ -4,7 +4,6 @@ from .data_fetch import (
     fetch_kline_eastmoney,
     fetch_kline_sina,
     fetch_kline_tencent,
-    fetch_policy_news_24h,
     fetch_snapshot,
 )
 
@@ -154,57 +153,13 @@ def infer_sector(stock: Dict) -> str:
         if any(k in txt for k in kws):
             return sector
     return stock.get('industry') or '其他'
-
-
-def pick_news_for_report(news: List[Dict], max_total: int = 10, max_neutral: int = 5) -> List[Dict]:
-    directional, neutral = [], []
-    for n in news:
-        if n.get('bullish_sectors') or n.get('bearish_sectors'):
-            directional.append(n)
-        else:
-            neutral.append(n)
-    picked = directional[:max_total]
-    if len(picked) < max_total:
-        picked.extend(neutral[: min(max_neutral, max_total - len(picked))])
-    return picked[:max_total]
-
-
-def build_policy_summary(news: List[Dict]) -> Tuple[List[str], str]:
-    if not news:
-        return ['资讯不足'], '过去24小时政策资讯有效样本不足，建议关注次日增量政策与板块催化。'
-
-    kw_score: Dict[str, int] = {}
-    for n in news:
-        title = n.get('title', '')
-        for k in ['降准', '降息', '流动性', '地产', '半导体', '算力', '电网', '储能', '医药', '原油', '出口', '关税', '监管']:
-            if k in title:
-                kw_score[k] = kw_score.get(k, 0) + 1
-
-    for n in news:
-        for sec in n.get('bullish_sectors', []) + n.get('bearish_sectors', []):
-            kw_score[sec] = kw_score.get(sec, 0) + 1
-
-    top_keywords = [k for k, _ in sorted(kw_score.items(), key=lambda x: x[1], reverse=True)[:6]]
-    if not top_keywords:
-        top_keywords = ['政策信号', '板块轮动']
-
-    bull_cnt = sum(1 for n in news if n.get('bullish_sectors'))
-    bear_cnt = sum(1 for n in news if n.get('bearish_sectors'))
-    neutral_cnt = len(news) - sum(1 for n in news if n.get('bullish_sectors') or n.get('bearish_sectors'))
-    summary = (
-        f'过去24小时政策资讯中，方向性新闻 {bull_cnt + bear_cnt} 条，偏中性新闻 {neutral_cnt} 条；'
-        f'结构上以“{top_keywords[0]}”相关主题最活跃，短线更关注板块分化与资金切换节奏。'
-    )
-    return top_keywords, summary
-
-
 def select(policy: Dict, top_n=10, horizon_days=30, max_api_calls: int = 50, sector_cap: int = 4):
     raw, api_calls_used = fetch_snapshot(max_api_calls=max_api_calls)
 
     min_price = 1.5
     min_amount = 3e7
     min_market_cap = 1e9
-    pe_max = 120
+    pe_max = 240  # 放宽PE约束：约束强度降为原来的1/2（上限由120放宽到240）
     pb_max = 20
 
     stats = {
@@ -321,7 +276,7 @@ def select(policy: Dict, top_n=10, horizon_days=30, max_api_calls: int = 50, sec
                 'macd': {k: (round(v, 4) if isinstance(v, float) else v) for k, v in tech['macd'].items()},
                 'kdj': {k: (round(v, 2) if isinstance(v, float) else v) for k, v in tech['kdj'].items()},
             },
-            'api_source': 'snapshot:sina;kline:auto;news:auto',
+            'api_source': 'snapshot:sina;kline:auto',
             'api_calls_used': api_calls_used,
         })
 
@@ -347,16 +302,10 @@ def select(policy: Dict, top_n=10, horizon_days=30, max_api_calls: int = 50, sec
             if len(selected) >= top_n:
                 break
 
-    policy_news_raw, news_source_status = fetch_policy_news_24h(max_items=20)
-    policy_news = pick_news_for_report(policy_news_raw, max_total=10, max_neutral=5)
-    policy_keywords, policy_summary = build_policy_summary(policy_news)
-
     kline_all_failed = all(kline_source_stats.get(x, {}).get('ok', 0) == 0 for x in ['eastmoney', 'tencent', 'sina-kline'])
     source_alerts = []
     if kline_all_failed:
         source_alerts.append('K线数据源全部失效（eastmoney/tencent/sina-kline）')
-    if news_source_status.get('all_failed'):
-        source_alerts.append('消息面数据源全部失效（sina-search/eastmoney-search/10jqka-stock）')
 
     source_status = {
         'kline': {
@@ -366,8 +315,7 @@ def select(policy: Dict, top_n=10, horizon_days=30, max_api_calls: int = 50, sec
             'stats': kline_source_stats,
             'all_failed': kline_all_failed,
         },
-        'news': news_source_status,
         'alerts': source_alerts,
     }
 
-    return selected[:top_n], api_calls_used, stats, policy_news, policy_keywords, policy_summary, source_status
+    return selected[:top_n], api_calls_used, stats, source_status

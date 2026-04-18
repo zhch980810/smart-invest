@@ -1,21 +1,13 @@
-import html
 import json
-import re
 import time
-from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
-from zoneinfo import ZoneInfo
 
 import requests
 
 SINA_QUOTE_URL = 'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData'
-SINA_SEARCH_URL = 'https://search.sina.com.cn/'
 EAST_KLINE_URL = 'https://push2his.eastmoney.com/api/qt/stock/kline/get'
 TENCENT_KLINE_URL = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
 SINA_KLINE_URL = 'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData'
-EAST_NEWS_SEARCH_URL = 'https://so.eastmoney.com/news/s'
-NEWS_10JQKA_URL = 'https://stock.10jqka.com.cn/tzjh_list/'
-TZ = ZoneInfo('Asia/Shanghai')
 
 DEFAULT_HEADERS = {
     'User-Agent': (
@@ -30,19 +22,6 @@ DEFAULT_HEADERS = {
 SINA_HEADERS = {'Referer': 'https://finance.sina.com.cn/'}
 EASTMONEY_HEADERS = {'Referer': 'https://quote.eastmoney.com/'}
 TENCENT_HEADERS = {'Referer': 'https://gu.qq.com/'}
-JQKA_HEADERS = {'Referer': 'https://stock.10jqka.com.cn/'}
-
-# 新闻关键词 -> 利好/利空板块（可持续迭代）
-NEWS_IMPACT_RULES = [
-    {'kw': ['降准', '降息', '流动性', '宽信用'], 'bull': ['券商', '地产链', '可选消费'], 'bear': []},
-    {'kw': ['房地产', '地产', '保交楼'], 'bull': ['地产链', '建材家居', '银行'], 'bear': []},
-    {'kw': ['半导体', '芯片', '算力', '信创'], 'bull': ['半导体', '算力基础设施', '软件信创'], 'bear': []},
-    {'kw': ['电网', '特高压', '储能'], 'bull': ['电网设备', '储能', '电力设备'], 'bear': []},
-    {'kw': ['医药', '创新药', '医保'], 'bull': ['创新药', '医疗器械'], 'bear': []},
-    {'kw': ['油价上涨', '原油上涨', '地缘冲突'], 'bull': ['油气开采', '煤炭'], 'bear': ['航空', '化工中下游']},
-    {'kw': ['出口', '关税', '贸易摩擦'], 'bull': ['内需替代'], 'bear': ['出口链制造']},
-    {'kw': ['监管趋严', '处罚', '问责'], 'bull': [], 'bear': ['高估值题材股', '受监管直接行业']},
-]
 
 
 def request_with_retry(request_fn, retries=3, sleep_sec=1.2):
@@ -139,201 +118,6 @@ def fetch_snapshot(max_api_calls: int = 50, per_page: int = 100) -> Tuple[List[D
         raise RuntimeError('新浪接口返回为空，无法构建股票池。')
 
     return rows, api_calls_used
-
-
-def classify_news_impact(title: str) -> Tuple[List[str], List[str]]:
-    bull, bear = set(), set()
-    for rule in NEWS_IMPACT_RULES:
-        if any(k in title for k in rule['kw']):
-            bull.update(rule['bull'])
-            bear.update(rule['bear'])
-    return sorted(bull), sorted(bear)
-
-
-def _append_news_item(news: List[Dict], seen: set, ts: datetime, title: str, url: str, source: str):
-    key = (title, url)
-    if key in seen:
-        return
-    seen.add(key)
-    bull, bear = classify_news_impact(title)
-    news.append({
-        'time': ts,
-        'title': title,
-        'url': url,
-        'source': source,
-        'bullish_sectors': bull,
-        'bearish_sectors': bear,
-    })
-
-
-def fetch_policy_news_sina(now: datetime, since: datetime, max_items: int = 20) -> List[Dict]:
-    keywords = ['A股 政策', '证监会', '央行', '财政 政策 资本市场', '两会 资本市场', '产业政策']
-    news: List[Dict] = []
-    seen = set()
-    for kw in keywords:
-        if len(news) >= max_items:
-            break
-        try:
-            resp = request_with_retry(
-                lambda: http_get(
-                    SINA_SEARCH_URL,
-                    params={'q': kw, 'c': 'news', 'from': 'channel'},
-                    timeout=12,
-                    headers=SINA_HEADERS,
-                ),
-                retries=2,
-                sleep_sec=0.8,
-            )
-            text = resp.text
-        except Exception:
-            continue
-
-        for m in re.finditer(r'<h2>(.*?)</h2>.*?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text, re.S):
-            h2 = m.group(1)
-            dt_raw = m.group(2)
-            a = re.search(r'href="([^"]+)"[^>]*>(.*?)</a>', h2, re.S)
-            if not a:
-                continue
-            try:
-                ts = datetime.strptime(dt_raw, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ)
-            except Exception:
-                continue
-            if ts < since or ts > now:
-                continue
-            title = html.unescape(re.sub('<.*?>', '', a.group(2))).strip()
-            url = a.group(1).strip()
-            _append_news_item(news, seen, ts, title, url, 'sina-search')
-    news.sort(key=lambda x: x['time'], reverse=True)
-    return news[:max_items]
-
-
-def fetch_policy_news_eastmoney(now: datetime, since: datetime, max_items: int = 20) -> List[Dict]:
-    keywords = ['A股 政策', '证监会', '央行', '财政 资本市场', '产业政策']
-    news: List[Dict] = []
-    seen = set()
-    for kw in keywords:
-        if len(news) >= max_items:
-            break
-        try:
-            resp = request_with_retry(
-                lambda: http_get(
-                    EAST_NEWS_SEARCH_URL,
-                    params={'keyword': kw},
-                    timeout=12,
-                    headers=EASTMONEY_HEADERS,
-                ),
-                retries=2,
-                sleep_sec=0.8,
-            )
-            text = resp.text
-        except Exception:
-            continue
-
-        for m in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*title="([^"]+)"[^>]*>.*?</a>.*?(\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2})?)', text, re.S):
-            url = html.unescape(m.group(1).strip())
-            title = html.unescape(m.group(2).strip())
-            dt_raw = m.group(3).strip()
-            try:
-                ts = datetime.strptime(dt_raw, '%Y-%m-%d %H:%M').replace(tzinfo=TZ) if len(dt_raw) == 16 else datetime.strptime(dt_raw, '%Y-%m-%d').replace(tzinfo=TZ)
-            except Exception:
-                continue
-            if ts < since or ts > now:
-                continue
-            _append_news_item(news, seen, ts, title, url, 'eastmoney-search')
-    news.sort(key=lambda x: x['time'], reverse=True)
-    return news[:max_items]
-
-
-def parse_10jqka_timestamp(dt_raw: str, now: datetime) -> datetime:
-    dt_raw = re.sub(r'\s+', ' ', dt_raw).strip()
-    month, day, hm = re.match(r'(\d{2})月(\d{2})日\s+(\d{2}:\d{2})', dt_raw).groups()
-    ts = datetime.strptime(f'{now.year}-{month}-{day} {hm}', '%Y-%m-%d %H:%M').replace(tzinfo=TZ)
-    if ts > now + timedelta(days=1):
-        ts = ts.replace(year=ts.year - 1)
-    return ts
-
-
-def fetch_policy_news_10jqka(now: datetime, since: datetime, max_items: int = 20) -> List[Dict]:
-    news: List[Dict] = []
-    seen = set()
-    try:
-        resp = request_with_retry(
-            lambda: http_get(NEWS_10JQKA_URL, timeout=12, headers=JQKA_HEADERS, encoding='gbk'),
-            retries=2,
-            sleep_sec=0.8,
-        )
-        text = resp.text
-    except Exception:
-        return news
-
-    pattern = re.compile(
-        r'<li>\s*<span class="arc-title">\s*<a[^>]+href="([^"]+)"[^>]+title="([^"]+)"[^>]*>.*?</a>\s*<span>(\d{2}月\d{2}日\s+\d{2}:\d{2})</span>',
-        re.S,
-    )
-    for m in pattern.finditer(text):
-        url = html.unescape(m.group(1).strip())
-        title = html.unescape(re.sub('<.*?>', '', m.group(2))).strip()
-        try:
-            ts = parse_10jqka_timestamp(m.group(3), now)
-        except Exception:
-            continue
-        if ts < since or ts > now:
-            continue
-        if not any(k in title for k in ['A股', '证监会', '央行', '政策', '资本市场', '产业']):
-            continue
-        _append_news_item(news, seen, ts, title, url, '10jqka-stock')
-        if len(news) >= max_items:
-            break
-
-    news.sort(key=lambda x: x['time'], reverse=True)
-    return news[:max_items]
-
-
-def fetch_policy_news_24h(max_items: int = 10) -> Tuple[List[Dict], Dict]:
-    now = datetime.now(TZ)
-    since = now - timedelta(hours=24)
-
-    providers = [
-        ('sina-search', fetch_policy_news_sina),
-        ('eastmoney-search', fetch_policy_news_eastmoney),
-        ('10jqka-stock', fetch_policy_news_10jqka),
-    ]
-
-    status = {
-        'primary': 'sina-search',
-        'backup': 'eastmoney-search',
-        'fallback': '10jqka-stock',
-        'used': None,
-        'errors': [],
-    }
-    combined: List[Dict] = []
-    seen = set()
-
-    for idx, (name, provider) in enumerate(providers):
-        try:
-            items = provider(now, since, max_items=max_items * 2)
-        except Exception as e:
-            status['errors'].append(f'{name}: {e}')
-            continue
-
-        if items:
-            if idx > 0:
-                status['errors'].append(f'主来源无可用数据，已切换至 {name}')
-            status['used'] = name
-            for x in items:
-                key = (x.get('title', ''), x.get('url', ''))
-                if key in seen:
-                    continue
-                seen.add(key)
-                combined.append(x)
-                if len(combined) >= max_items:
-                    break
-            break
-        status['errors'].append(f'{name}: 返回为空')
-
-    combined.sort(key=lambda x: x['time'], reverse=True)
-    status['all_failed'] = len(combined) == 0
-    return combined[:max_items], status
 
 
 def code_to_secid(code: str) -> str:
